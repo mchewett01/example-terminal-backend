@@ -223,6 +223,39 @@ def payment_customer_email(payment_intent, charge)
   email.empty? ? nil : email
 end
 
+
+def customer_for_receipt(email, name = nil)
+  normalized_email = email.to_s.strip
+  return nil if normalized_email.empty?
+
+  existing = Stripe::Customer.list(
+    :email => normalized_email,
+    :limit => 1
+  ).data.first
+
+  if !existing.nil?
+    normalized_name = name.to_s.strip
+
+    if existing.name.to_s.strip.empty? && !normalized_name.empty?
+      existing = Stripe::Customer.update(
+        existing.id,
+        :name => normalized_name
+      )
+    end
+
+    return existing
+  end
+
+  customer_params = {
+    :email => normalized_email
+  }
+
+  normalized_name = name.to_s.strip
+  customer_params[:name] = normalized_name if !normalized_name.empty?
+
+  Stripe::Customer.create(customer_params)
+end
+
 def transaction_payload(payment_intent)
   charge = full_charge_for_payment_intent(payment_intent)
   return nil if charge.nil?
@@ -359,14 +392,28 @@ post '/create_payment_intent' do
   end
 
   begin
-    payment_intent = Stripe::PaymentIntent.create(
+    receipt_email = params[:receipt_email].to_s.strip
+    customer = customer_for_receipt(receipt_email)
+
+    payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
       :capture_method => params[:capture_method] || 'manual',
       :amount => params[:amount],
       :currency => params[:currency] || 'usd',
       :description => params[:description] || 'Example PaymentIntent',
-      :payment_method_options => params[:payment_method_options] || [],
-      :receipt_email => params[:receipt_email],
+      :payment_method_options => params[:payment_method_options] || []
+    }
+
+    if !receipt_email.empty?
+      payment_intent_params[:receipt_email] = receipt_email
+    end
+
+    if !customer.nil?
+      payment_intent_params[:customer] = customer.id
+    end
+
+    payment_intent = Stripe::PaymentIntent.create(
+      payment_intent_params
     )
   rescue Stripe::StripeError => e
     status 402
@@ -424,15 +471,32 @@ post '/create_emulator_test_payment' do
   }
 
   begin
-    payment_intent = Stripe::PaymentIntent.create(
+    receipt_email = params[:receipt_email].to_s.strip
+    customer = customer_for_receipt(
+      receipt_email,
+      params[:customer_name]
+    )
+
+    payment_intent_params = {
       :amount => amount,
       :currency => params[:currency] || 'usd',
       :payment_method_types => ['card'],
       :payment_method => 'pm_card_visa',
       :confirm => true,
       :description => params[:description] || 'Hewett POS emulator test payment',
-      :receipt_email => params[:receipt_email],
       :metadata => metadata
+    }
+
+    if !receipt_email.empty?
+      payment_intent_params[:receipt_email] = receipt_email
+    end
+
+    if !customer.nil?
+      payment_intent_params[:customer] = customer.id
+    end
+
+    payment_intent = Stripe::PaymentIntent.create(
+      payment_intent_params
     )
   rescue Stripe::StripeError => e
     return json_response(
