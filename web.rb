@@ -184,6 +184,18 @@ def terminal_payment_intent?(payment_intent)
   charge.payment_method_details.type.to_s == 'card_present'
 end
 
+def emulator_test_payment_intent?(payment_intent)
+  return false if payment_intent.nil?
+  return false if payment_intent.metadata.nil?
+
+  payment_intent.metadata['hewett_pos_emulator_test'].to_s == 'true'
+end
+
+def pos_payment_intent?(payment_intent)
+  terminal_payment_intent?(payment_intent) ||
+    emulator_test_payment_intent?(payment_intent)
+end
+
 def processing_fee_cents(charge)
   return nil if charge.nil?
 
@@ -366,6 +378,80 @@ post '/create_payment_intent' do
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
+# Creates a genuine Stripe TEST-mode card payment for Android emulator testing.
+#
+# The emulator cannot present a physical card to the Terminal SDK, so this
+# endpoint uses Stripe's standard test Visa PaymentMethod and immediately
+# confirms the PaymentIntent. The resulting payment is tagged in metadata so
+# the POS transaction-history screen can include it alongside real
+# card-present S710 payments.
+#
+# This endpoint intentionally refuses to run with a live secret key.
+post '/create_emulator_test_payment' do
+  validationError = validateApiKey
+  if !validationError.nil?
+    return json_response({ :error => validationError }, 400)
+  end
+
+  if !Stripe.api_key.to_s.start_with?('sk_test')
+    return json_response(
+      { :error => 'Emulator test payments are disabled outside Stripe test mode.' },
+      403
+    )
+  end
+
+  amount = params[:amount].to_i
+
+  if amount <= 0
+    return json_response(
+      { :error => 'A positive payment amount is required.' },
+      400
+    )
+  end
+
+  metadata = {
+    :hewett_pos_emulator_test => 'true',
+    :source => 'android_emulator',
+    :painting_name => params[:painting_name].to_s,
+    :customer_name => params[:customer_name].to_s,
+    :fair_name => params[:fair_name].to_s,
+    :fulfillment => params[:fulfillment].to_s,
+    :list_price_cents => params[:list_price_cents].to_s,
+    :discount_cents => params[:discount_cents].to_s,
+    :subtotal_cents => params[:subtotal_cents].to_s,
+    :tax_cents => params[:tax_cents].to_s,
+    :shipping_cents => params[:shipping_cents].to_s
+  }
+
+  begin
+    payment_intent = Stripe::PaymentIntent.create(
+      :amount => amount,
+      :currency => params[:currency] || 'usd',
+      :payment_method_types => ['card'],
+      :payment_method => 'pm_card_visa',
+      :confirm => true,
+      :description => params[:description] || 'Hewett POS emulator test payment',
+      :receipt_email => params[:receipt_email],
+      :metadata => metadata
+    )
+  rescue Stripe::StripeError => e
+    return json_response(
+      { :error => "Error creating emulator test payment: #{e.message}" },
+      402
+    )
+  end
+
+  log_info("Emulator test PaymentIntent successfully created: #{payment_intent.id}")
+
+  json_response(
+    {
+      :intent => payment_intent.id,
+      :secret => payment_intent.client_secret
+    },
+    200
+  )
+end
+
 # This endpoint captures a PaymentIntent.
 # https://stripe.com/docs/terminal/payments#capture
 post '/capture_payment_intent' do
@@ -517,7 +603,9 @@ post '/update_payment_intent' do
 end
 
 
-# This endpoint lists captured Stripe Terminal payments for the POS return screen.
+# This endpoint lists captured Hewett POS payments for the return screen.
+# It includes real Stripe Terminal card-present payments plus explicitly tagged
+# Android-emulator test payments created by /create_emulator_test_payment.
 # It returns the actual Stripe fee from the Charge's balance transaction so the
 # app never has to estimate a restocking fee.
 #
@@ -541,7 +629,7 @@ get '/pos_transactions' do
       payment_intents.data
         .select do |payment_intent|
           payment_intent.status.to_s == 'succeeded' &&
-            terminal_payment_intent?(payment_intent)
+            pos_payment_intent?(payment_intent)
         end
         .map { |payment_intent| transaction_payload(payment_intent) }
         .compact
@@ -598,11 +686,11 @@ post '/refund_payment_intent' do
       )
     end
 
-    if !terminal_payment_intent?(payment_intent)
+    if !pos_payment_intent?(payment_intent)
       return json_response(
         {
           :error =>
-            'This payment was not a Stripe Terminal card-present payment.'
+            'This payment was not created by the Hewett POS app.'
         },
         400
       )
