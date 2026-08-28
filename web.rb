@@ -3,6 +3,7 @@ require 'stripe'
 require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
+require 'rack/utils'
 
 # Browsers require that external servers enable CORS when the server is at a different origin than the website.
 # https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
@@ -17,7 +18,7 @@ end
 
 options "*" do
   response.headers["Allow"] = "GET, POST, OPTIONS"
-  response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-User-Email, X-Auth-Token"
+  response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-User-Email, X-Auth-Token, X-POS-PIN"
   response.headers["Access-Control-Allow-Origin"] = "*"
   200
 end
@@ -30,6 +31,231 @@ def log_info(message)
   puts "\n" + message + "\n\n"
   return message
 end
+
+# --- Hewett POS transaction history / returns helpers -----------------------
+
+POS_AUTH_MAX_FAILURES = 5
+POS_AUTH_WINDOW_SECONDS = 10 * 60
+POS_AUTH_LOCKOUT_SECONDS = 15 * 60
+POS_AUTH_FAILURES = {}
+
+def json_response(payload, status_code = 200)
+  content_type :json
+  status status_code
+  payload.to_json
+end
+
+def request_ip_address
+  request.ip.to_s
+end
+
+def cleanup_pos_auth_failures!
+  now = Time.now.to_i
+
+  POS_AUTH_FAILURES.delete_if do |_ip, record|
+    last_failure = record[:last_failure].to_i
+    locked_until = record[:locked_until].to_i
+
+    locked_until <= now &&
+      last_failure > 0 &&
+      now - last_failure > POS_AUTH_WINDOW_SECONDS
+  end
+end
+
+def pos_auth_record
+  cleanup_pos_auth_failures!
+
+  POS_AUTH_FAILURES[request_ip_address] ||= {
+    failures: [],
+    last_failure: 0,
+    locked_until: 0
+  }
+end
+
+def pos_auth_locked?
+  pos_auth_record[:locked_until].to_i > Time.now.to_i
+end
+
+def record_pos_auth_failure!
+  now = Time.now.to_i
+  record = pos_auth_record
+
+  recent_failures =
+    record[:failures]
+      .select { |timestamp| now - timestamp < POS_AUTH_WINDOW_SECONDS }
+
+  recent_failures << now
+
+  record[:failures] = recent_failures
+  record[:last_failure] = now
+
+  if recent_failures.length >= POS_AUTH_MAX_FAILURES
+    record[:locked_until] = now + POS_AUTH_LOCKOUT_SECONDS
+  end
+end
+
+def clear_pos_auth_failures!
+  POS_AUTH_FAILURES.delete(request_ip_address)
+end
+
+def pos_admin_pin
+  ENV['POS_ADMIN_PIN'].to_s
+end
+
+def pos_authorized?
+  expected = pos_admin_pin
+  provided = request.env['HTTP_X_POS_PIN'].to_s
+
+  return false if expected.empty? || provided.empty?
+  return false unless expected.bytesize == provided.bytesize
+
+  Rack::Utils.secure_compare(expected, provided)
+end
+
+def require_pos_authorization!
+  if pos_admin_pin.empty?
+    halt 503, json_response(
+      {
+        :error =>
+          "POS_ADMIN_PIN is not configured on the backend."
+      },
+      503
+    )
+  end
+
+  if pos_auth_locked?
+    halt 429, json_response(
+      {
+        :error =>
+          "Too many incorrect PIN attempts. Try again in 15 minutes."
+      },
+      429
+    )
+  end
+
+  if !pos_authorized?
+    record_pos_auth_failure!
+
+    halt 401, json_response(
+      { :error => "Invalid admin PIN." },
+      401
+    )
+  end
+
+  clear_pos_auth_failures!
+end
+
+def successful_charge_from_payment_intent(payment_intent)
+  return nil if payment_intent.nil?
+  return nil if payment_intent.charges.nil?
+  return nil if payment_intent.charges.data.nil?
+  return nil if payment_intent.charges.data.empty?
+
+  payment_intent.charges.data.find do |charge|
+    charge.status.to_s == 'succeeded'
+  end || payment_intent.charges.data.first
+end
+
+def full_charge_for_payment_intent(payment_intent)
+  charge = successful_charge_from_payment_intent(payment_intent)
+  return nil if charge.nil?
+
+  # When PaymentIntent.list expands the Charge, all fields we need are
+  # already present. When a PaymentIntent is retrieved without expansion,
+  # retrieve the Charge directly to ensure amount_refunded and
+  # balance_transaction are current.
+  if !charge.balance_transaction.nil?
+    return charge
+  end
+
+  Stripe::Charge.retrieve(charge.id)
+end
+
+def terminal_payment_intent?(payment_intent)
+  payment_method_types =
+    payment_intent.payment_method_types || []
+
+  return true if payment_method_types.include?('card_present')
+
+  charge = successful_charge_from_payment_intent(payment_intent)
+  return false if charge.nil?
+  return false if charge.payment_method_details.nil?
+
+  charge.payment_method_details.type.to_s == 'card_present'
+end
+
+def processing_fee_cents(charge)
+  return nil if charge.nil?
+
+  balance_transaction = charge.balance_transaction
+  return nil if balance_transaction.nil?
+
+  if !balance_transaction.is_a?(String)
+    return balance_transaction.fee.to_i
+  end
+
+  Stripe::BalanceTransaction
+    .retrieve(balance_transaction)
+    .fee
+    .to_i
+end
+
+def payment_customer_email(payment_intent, charge)
+  receipt_email = payment_intent.receipt_email.to_s
+  return receipt_email if !receipt_email.empty?
+
+  return nil if charge.nil?
+  return nil if charge.billing_details.nil?
+
+  email = charge.billing_details.email.to_s
+  email.empty? ? nil : email
+end
+
+def transaction_payload(payment_intent)
+  charge = full_charge_for_payment_intent(payment_intent)
+  return nil if charge.nil?
+
+  amount = charge.amount.to_i
+  amount_refunded = charge.amount_refunded.to_i
+  fee = processing_fee_cents(charge)
+
+  # If Stripe has not made the balance transaction / fee available yet,
+  # do not make a refund available. We never guess at the fee.
+  if fee.nil?
+    maximum_policy_refund = 0
+    remaining_policy_refund = 0
+    transaction_status = 'fee_pending'
+    fee_for_payload = 0
+  else
+    maximum_policy_refund = [amount - fee, 0].max
+    remaining_policy_refund =
+      [maximum_policy_refund - amount_refunded, 0].max
+    fee_for_payload = fee
+
+    transaction_status =
+      if amount_refunded >= amount
+        'refunded'
+      elsif amount_refunded.positive?
+        'partially_refunded'
+      else
+        payment_intent.status.to_s
+      end
+  end
+
+  {
+    :paymentIntentId => payment_intent.id,
+    :created => payment_intent.created.to_i,
+    :description => payment_intent.description,
+    :customerEmail => payment_customer_email(payment_intent, charge),
+    :amountCents => amount,
+    :amountRefundedCents => amount_refunded,
+    :processingFeeCents => fee_for_payload,
+    :remainingPolicyRefundCents => remaining_policy_refund,
+    :currency => charge.currency.to_s,
+    :status => transaction_status
+  }
+end
+
 
 get '/' do
   status 200
@@ -289,6 +515,183 @@ post '/update_payment_intent' do
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
+
+
+# This endpoint lists captured Stripe Terminal payments for the POS return screen.
+# It returns the actual Stripe fee from the Charge's balance transaction so the
+# app never has to estimate a restocking fee.
+#
+# The API version used by this sample backend is 2020-03-02, so the Charge and
+# its balance transaction are expanded through PaymentIntent.charges.
+get '/pos_transactions' do
+  validationError = validateApiKey
+  if !validationError.nil?
+    return json_response({ :error => validationError }, 400)
+  end
+
+  require_pos_authorization!
+
+  begin
+    payment_intents = Stripe::PaymentIntent.list(
+      :limit => 100,
+      :expand => ['data.charges.data.balance_transaction']
+    )
+
+    transactions =
+      payment_intents.data
+        .select do |payment_intent|
+          payment_intent.status.to_s == 'succeeded' &&
+            terminal_payment_intent?(payment_intent)
+        end
+        .map { |payment_intent| transaction_payload(payment_intent) }
+        .compact
+  rescue Stripe::StripeError => e
+    return json_response(
+      { :error => "Error fetching transactions: #{e.message}" },
+      402
+    )
+  end
+
+  json_response(transactions, 200)
+end
+
+# Issues the maximum refund permitted by the Hewett POS return policy:
+#
+#   customer refund =
+#     original Stripe charge - actual original Stripe processing fee
+#     - any amount already refunded
+#
+# Because the original Stripe charge already includes artwork, applicable tax,
+# and shipping, those amounts are included in this return calculation. The only
+# retained amount is the actual original Stripe processing fee.
+#
+# The refund goes back to the original payment method. No card presentation on
+# the S710 is required.
+post '/refund_payment_intent' do
+  validationError = validateApiKey
+  if !validationError.nil?
+    return json_response({ :error => validationError }, 400)
+  end
+
+  require_pos_authorization!
+
+  payment_intent_id = params['payment_intent_id'].to_s
+
+  if payment_intent_id.empty?
+    return json_response(
+      { :error => 'payment_intent_id is required.' },
+      400
+    )
+  end
+
+  begin
+    payment_intent =
+      Stripe::PaymentIntent.retrieve(payment_intent_id)
+
+    if payment_intent.status.to_s != 'succeeded'
+      return json_response(
+        {
+          :error =>
+            'Only successful captured payments can be refunded.'
+        },
+        400
+      )
+    end
+
+    if !terminal_payment_intent?(payment_intent)
+      return json_response(
+        {
+          :error =>
+            'This payment was not a Stripe Terminal card-present payment.'
+        },
+        400
+      )
+    end
+
+    charge = full_charge_for_payment_intent(payment_intent)
+
+    if charge.nil?
+      return json_response(
+        {
+          :error =>
+            'No successful charge was found for this payment.'
+        },
+        400
+      )
+    end
+
+    original_amount = charge.amount.to_i
+    already_refunded = charge.amount_refunded.to_i
+    processing_fee = processing_fee_cents(charge)
+
+    if processing_fee.nil?
+      return json_response(
+        {
+          :error =>
+            'Stripe has not made the processing fee available yet. Try again shortly.'
+        },
+        409
+      )
+    end
+
+    maximum_policy_refund =
+      [original_amount - processing_fee, 0].max
+
+    refund_amount =
+      [maximum_policy_refund - already_refunded, 0].max
+
+    if refund_amount <= 0
+      return json_response(
+        {
+          :error =>
+            'No additional refund is available under the restocking-fee policy.'
+        },
+        400
+      )
+    end
+
+    # The idempotency key prevents a retry or accidental double tap from
+    # creating a duplicate refund for the same refund state.
+    idempotency_key =
+      "hewett-pos-return-#{payment_intent.id}-#{already_refunded}-#{refund_amount}"
+
+    refund = Stripe::Refund.create(
+      {
+        :payment_intent => payment_intent.id,
+        :amount => refund_amount,
+        :reason => 'requested_by_customer',
+        :metadata => {
+          :restocking_fee_cents => processing_fee.to_s,
+          :original_charge_cents => original_amount.to_s,
+          :refund_policy =>
+            'original_stripe_processing_fee_retained'
+        }
+      },
+      {
+        :idempotency_key => idempotency_key
+      }
+    )
+
+    return json_response(
+      {
+        :refundId => refund.id,
+        :paymentIntentId => payment_intent.id,
+        :refundAmountCents => refund.amount.to_i,
+        :processingFeeCents => processing_fee,
+        :amountRefundedCents =>
+          already_refunded + refund.amount.to_i,
+        :status => refund.status.to_s
+      },
+      200
+    )
+  rescue Stripe::StripeError => e
+    return json_response(
+      { :error => "Error issuing refund: #{e.message}" },
+      402
+    )
+  end
+end
+
 
 # This endpoint lists the first 100 Locations. If you will have more than 100
 # Locations, you'll likely want to implement pagination in your application so that

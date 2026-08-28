@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: example-terminal-backend
+    name: hewett-pos-backend
     env: ruby
     region: oregon
     plan: free
@@ -8,4 +8,6 @@ services:
     startCommand: bundle exec ruby web.rb
     envVars:
       - key: STRIPE_TEST_SECRET_KEY
-        sync: false # placeholder for a value to be added in the dashboard
+        sync: false # keep your existing test secret in the Render dashboard
+      - key: POS_ADMIN_PIN
+        sync: false # set this in Render; recommend an 8-digit or longer PIN
