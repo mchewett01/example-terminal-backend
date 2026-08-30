@@ -264,6 +264,46 @@ def payment_metadata(payment_intent)
   metadata.respond_to?(:to_hash) ? metadata.to_hash : metadata
 end
 
+# Extracts POS metadata from an Android form request in a way that is robust
+# across Rack/Sinatra parsing behavior. The Android app sends every value in
+# two forms:
+#
+#   metadata[item_count]=2
+#   pos_meta_item_count=2
+#
+# The explicit pos_meta_ fields are authoritative. We retain support for the
+# nested and literal bracketed forms for backwards compatibility.
+def extract_pos_metadata(request_params)
+  metadata = {}
+
+  nested =
+    request_params['metadata'] ||
+    request_params[:metadata]
+
+  if nested.respond_to?(:each)
+    nested.each do |key, value|
+      metadata[key.to_s] = value.to_s
+    end
+  end
+
+  request_params.each do |key, value|
+    key_string = key.to_s
+
+    if key_string.start_with?('pos_meta_')
+      metadata_key = key_string.sub('pos_meta_', '')
+      metadata[metadata_key] = value.to_s
+      next
+    end
+
+    match = key_string.match(/\Ametadata\[(.+)\]\z/)
+    if !match.nil?
+      metadata[match[1]] ||= value.to_s
+    end
+  end
+
+  metadata
+end
+
 def metadata_integer(payment_intent, key)
   payment_metadata(payment_intent)[key.to_s].to_i
 end
@@ -748,7 +788,8 @@ post '/create_payment_intent' do
 
   begin
     receipt_email = params[:receipt_email].to_s.strip
-    metadata = params[:metadata] || {}
+    metadata = extract_pos_metadata(params)
+    log_info("POS payment metadata item_count=#{metadata['item_count']} keys=#{metadata.keys.sort.join(',')}")
     customer_name = metadata['customer_name'].to_s
 
     customer = customer_for_receipt(
@@ -819,10 +860,12 @@ post '/create_emulator_test_payment' do
     )
   end
 
-  metadata = (params[:metadata] || {}).dup
+  metadata = extract_pos_metadata(params)
   metadata['hewett_pos'] = 'true'
   metadata['hewett_pos_emulator_test'] = 'true'
   metadata['source'] = 'android_emulator'
+
+  log_info("POS emulator metadata item_count=#{metadata['item_count']} keys=#{metadata.keys.sort.join(',')}")
 
   begin
     receipt_email = params[:receipt_email].to_s.strip
