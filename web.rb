@@ -256,6 +256,179 @@ def customer_for_receipt(email, name = nil)
   Stripe::Customer.create(customer_params)
 end
 
+def payment_metadata(payment_intent)
+  return {} if payment_intent.nil?
+  metadata = payment_intent.metadata
+  return {} if metadata.nil?
+
+  metadata.respond_to?(:to_hash) ? metadata.to_hash : metadata
+end
+
+def metadata_integer(payment_intent, key)
+  payment_metadata(payment_intent)[key.to_s].to_i
+end
+
+def parse_pos_items(payment_intent)
+  metadata = payment_metadata(payment_intent)
+  count = metadata['item_count'].to_i
+
+  return [] if count <= 0
+
+  items = []
+
+  count.times do |index|
+    raw = metadata["item_#{index}"].to_s
+    next if raw.empty?
+
+    parts = raw.split('~', 3)
+    next if parts.length < 3
+
+    item_id = parts[0].to_s
+    list_price = parts[1].to_i
+    item_name = parts[2].to_s
+
+    next if item_id.empty? || list_price <= 0
+
+    items << {
+      :id => item_id,
+      :name => item_name.empty? ? item_id : item_name,
+      :listPriceCents => list_price
+    }
+  end
+
+  items
+end
+
+def proportional_allocations(total, weights)
+  total = total.to_i
+  weights = weights.map(&:to_i)
+  weight_total = weights.sum
+
+  return Array.new(weights.length, 0) if total <= 0 || weight_total <= 0
+
+  allocations = []
+  remainders = []
+
+  weights.each_with_index do |weight, index|
+    numerator = total * weight
+    quotient, remainder = numerator.divmod(weight_total)
+
+    allocations << quotient
+    remainders << [remainder, index]
+  end
+
+  cents_left = total - allocations.sum
+
+  remainders
+    .sort_by { |remainder, index| [-remainder, index] }
+    .first(cents_left)
+    .each do |_remainder, index|
+      allocations[index] += 1
+    end
+
+  allocations
+end
+
+def allocated_pos_items(payment_intent)
+  items = parse_pos_items(payment_intent)
+  return [] if items.empty?
+
+  weights = items.map { |item| item[:listPriceCents].to_i }
+  subtotal_total = metadata_integer(payment_intent, 'subtotal_cents')
+  tax_total = metadata_integer(payment_intent, 'tax_cents')
+
+  subtotal_allocations =
+    proportional_allocations(subtotal_total, weights)
+
+  tax_allocations =
+    proportional_allocations(tax_total, weights)
+
+  items.each_with_index.map do |item, index|
+    subtotal = subtotal_allocations[index].to_i
+    tax = tax_allocations[index].to_i
+
+    item.merge(
+      :allocatedSubtotalCents => subtotal,
+      :allocatedTaxCents => tax,
+      :grossReturnValueCents => subtotal + tax
+    )
+  end
+end
+
+def refunds_for_charge(charge)
+  return [] if charge.nil?
+
+  Stripe::Refund.list(
+    :charge => charge.id,
+    :limit => 100
+  ).data
+end
+
+def pos_refund_state(payment_intent, charge)
+  gross_return_value_used = 0
+  restocking_fee_retained = 0
+  shipping_refunded = 0
+  returned_item_ids = []
+  tracked_refund_amount = 0
+
+  refunds_for_charge(charge).each do |refund|
+    refund_status = refund.status.to_s
+    next if refund_status == 'failed' || refund_status == 'canceled'
+
+    tracked_refund_amount += refund.amount.to_i
+
+    metadata =
+      if refund.metadata.nil?
+        {}
+      elsif refund.metadata.respond_to?(:to_hash)
+        refund.metadata.to_hash
+      else
+        refund.metadata
+      end
+
+    retained_fee =
+      if metadata['restocking_fee_retained_cents'].to_s.empty?
+        metadata['restocking_fee_cents'].to_i
+      else
+        metadata['restocking_fee_retained_cents'].to_i
+      end
+
+    gross_value =
+      if metadata['gross_return_value_cents'].to_s.empty?
+        refund.amount.to_i + retained_fee
+      else
+        metadata['gross_return_value_cents'].to_i
+      end
+
+    gross_return_value_used += gross_value
+    restocking_fee_retained += retained_fee
+    shipping_refunded += metadata['shipping_refunded_cents'].to_i
+
+    item_ids =
+      metadata['returned_item_ids']
+        .to_s
+        .split(',')
+        .map(&:strip)
+        .reject(&:empty?)
+
+    returned_item_ids.concat(item_ids)
+  end
+
+  # If a refund was issued directly in Stripe rather than through the POS,
+  # include it in the used return value so the app can never over-refund.
+  untracked_refund =
+    [charge.amount_refunded.to_i - tracked_refund_amount, 0].max
+
+  gross_return_value_used += untracked_refund
+
+  {
+    :gross_return_value_used => gross_return_value_used,
+    :restocking_fee_retained => restocking_fee_retained,
+    :shipping_refunded => shipping_refunded,
+    :returned_item_ids => returned_item_ids.uniq
+  }
+end
+
 def transaction_payload(payment_intent)
   charge = full_charge_for_payment_intent(payment_intent)
   return nil if charge.nil?
@@ -263,9 +436,8 @@ def transaction_payload(payment_intent)
   amount = charge.amount.to_i
   amount_refunded = charge.amount_refunded.to_i
   fee = processing_fee_cents(charge)
+  refund_state = pos_refund_state(payment_intent, charge)
 
-  # If Stripe has not made the balance transaction / fee available yet,
-  # do not make a refund available. We never guess at the fee.
   if fee.nil?
     maximum_policy_refund = 0
     remaining_policy_refund = 0
@@ -287,6 +459,19 @@ def transaction_payload(payment_intent)
       end
   end
 
+  returned_item_ids = refund_state[:returned_item_ids]
+
+  items =
+    allocated_pos_items(payment_intent).map do |item|
+      item.merge(
+        :returned => returned_item_ids.include?(item[:id])
+      )
+    end
+
+  shipping = metadata_integer(payment_intent, 'shipping_cents')
+  shipping_refunded =
+    [refund_state[:shipping_refunded].to_i, shipping].min
+
   {
     :paymentIntentId => payment_intent.id,
     :created => payment_intent.created.to_i,
@@ -297,7 +482,177 @@ def transaction_payload(payment_intent)
     :processingFeeCents => fee_for_payload,
     :remainingPolicyRefundCents => remaining_policy_refund,
     :currency => charge.currency.to_s,
-    :status => transaction_status
+    :status => transaction_status,
+    :listPriceCents => metadata_integer(payment_intent, 'list_price_cents'),
+    :discountCents => metadata_integer(payment_intent, 'discount_cents'),
+    :subtotalCents => metadata_integer(payment_intent, 'subtotal_cents'),
+    :taxCents => metadata_integer(payment_intent, 'tax_cents'),
+    :shippingCents => shipping,
+    :shippingRefundedCents => shipping_refunded,
+    :restockingFeeRetainedCents =>
+      refund_state[:restocking_fee_retained].to_i,
+    :grossReturnValueUsedCents =>
+      refund_state[:gross_return_value_used].to_i,
+    :items => items
+  }
+end
+
+def build_refund_quote(
+  payment_intent,
+  mode,
+  requested_item_ids = [],
+  include_shipping = false,
+  custom_gross_cents = 0
+)
+  if payment_intent.status.to_s != 'succeeded'
+    raise ArgumentError,
+      'Only successful captured payments can be refunded.'
+  end
+
+  if !pos_payment_intent?(payment_intent)
+    raise ArgumentError,
+      'This payment was not created by the Hewett POS app.'
+  end
+
+  charge = full_charge_for_payment_intent(payment_intent)
+
+  if charge.nil?
+    raise ArgumentError,
+      'No successful charge was found for this payment.'
+  end
+
+  original_amount = charge.amount.to_i
+  processing_fee = processing_fee_cents(charge)
+
+  if processing_fee.nil?
+    raise RuntimeError,
+      'Stripe has not made the processing fee available yet. Try again shortly.'
+  end
+
+  refund_state = pos_refund_state(payment_intent, charge)
+  gross_used = refund_state[:gross_return_value_used].to_i
+  fee_retained_so_far = refund_state[:restocking_fee_retained].to_i
+  returned_item_ids = refund_state[:returned_item_ids]
+
+  remaining_gross = [original_amount - gross_used, 0].max
+
+  if remaining_gross <= 0
+    raise ArgumentError,
+      'No additional return value is available for this transaction.'
+  end
+
+  items = allocated_pos_items(payment_intent)
+  available_items =
+    items.reject { |item| returned_item_ids.include?(item[:id]) }
+
+  shipping_total = metadata_integer(payment_intent, 'shipping_cents')
+  shipping_refunded_so_far =
+    [refund_state[:shipping_refunded].to_i, shipping_total].min
+  remaining_shipping =
+    [shipping_total - shipping_refunded_so_far, 0].max
+
+  selected_item_ids = []
+  shipping_refund = 0
+  gross_return_value = 0
+
+  case mode.to_s
+  when 'items'
+    if items.empty?
+      raise ArgumentError,
+        'Item-level return details are not available for this older transaction.'
+    end
+
+    requested = requested_item_ids.map(&:to_s).uniq
+
+    selected_items =
+      available_items.select { |item| requested.include?(item[:id]) }
+
+    if selected_items.length != requested.length
+      raise ArgumentError,
+        'One or more selected paintings are not available to return.'
+    end
+
+    selected_item_ids = selected_items.map { |item| item[:id] }
+    gross_return_value =
+      selected_items.sum { |item| item[:grossReturnValueCents].to_i }
+
+    if include_shipping && remaining_shipping > 0
+      shipping_refund = remaining_shipping
+      gross_return_value += shipping_refund
+    end
+
+    if gross_return_value <= 0
+      raise ArgumentError,
+        'Select at least one painting or remaining shipping charge.'
+    end
+
+  when 'custom'
+    gross_return_value = custom_gross_cents.to_i
+
+    if gross_return_value <= 0
+      raise ArgumentError,
+        'A positive custom return value is required.'
+    end
+
+  when 'full'
+    gross_return_value = remaining_gross
+    selected_item_ids = available_items.map { |item| item[:id] }
+    shipping_refund = remaining_shipping
+
+  else
+    raise ArgumentError,
+      'Unknown refund mode.'
+  end
+
+  if gross_return_value > remaining_gross
+    raise ArgumentError,
+      'That return exceeds the remaining refundable value of this transaction.'
+  end
+
+  cumulative_gross = gross_used + gross_return_value
+
+  target_cumulative_fee =
+    if original_amount <= 0
+      0
+    else
+      (
+        processing_fee * cumulative_gross +
+        original_amount / 2
+      ) / original_amount
+    end
+
+  target_cumulative_fee =
+    [target_cumulative_fee, processing_fee].min
+
+  restocking_fee_this_refund =
+    [target_cumulative_fee - fee_retained_so_far, 0].max
+
+  restocking_fee_this_refund =
+    [restocking_fee_this_refund, gross_return_value].min
+
+  refund_amount =
+    gross_return_value - restocking_fee_this_refund
+
+  if refund_amount <= 0
+    raise ArgumentError,
+      'The calculated customer refund is zero.'
+  end
+
+  {
+    :paymentIntentId => payment_intent.id,
+    :preview => true,
+    :mode => mode.to_s,
+    :grossReturnValueCents => gross_return_value,
+    :refundAmountCents => refund_amount,
+    :processingFeeCents => processing_fee,
+    :restockingFeeThisRefundCents => restocking_fee_this_refund,
+    :restockingFeeRetainedCents =>
+      fee_retained_so_far + restocking_fee_this_refund,
+    :amountRefundedCents => charge.amount_refunded.to_i,
+    :shippingRefundCents => shipping_refund,
+    :returnedItemIds => selected_item_ids,
+    :status => 'preview',
+    :charge => charge
   }
 end
 
@@ -393,7 +748,13 @@ post '/create_payment_intent' do
 
   begin
     receipt_email = params[:receipt_email].to_s.strip
-    customer = customer_for_receipt(receipt_email)
+    metadata = params[:metadata] || {}
+    customer_name = metadata['customer_name'].to_s
+
+    customer = customer_for_receipt(
+      receipt_email,
+      customer_name
+    )
 
     payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
@@ -401,7 +762,8 @@ post '/create_payment_intent' do
       :amount => params[:amount],
       :currency => params[:currency] || 'usd',
       :description => params[:description] || 'Example PaymentIntent',
-      :payment_method_options => params[:payment_method_options] || []
+      :payment_method_options => params[:payment_method_options] || [],
+      :metadata => metadata
     }
 
     if !receipt_email.empty?
@@ -424,6 +786,7 @@ post '/create_payment_intent' do
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
+
 
 # Creates a genuine Stripe TEST-mode card payment for Android emulator testing.
 #
@@ -456,25 +819,16 @@ post '/create_emulator_test_payment' do
     )
   end
 
-  metadata = {
-    :hewett_pos_emulator_test => 'true',
-    :source => 'android_emulator',
-    :painting_name => params[:painting_name].to_s,
-    :customer_name => params[:customer_name].to_s,
-    :fair_name => params[:fair_name].to_s,
-    :fulfillment => params[:fulfillment].to_s,
-    :list_price_cents => params[:list_price_cents].to_s,
-    :discount_cents => params[:discount_cents].to_s,
-    :subtotal_cents => params[:subtotal_cents].to_s,
-    :tax_cents => params[:tax_cents].to_s,
-    :shipping_cents => params[:shipping_cents].to_s
-  }
+  metadata = (params[:metadata] || {}).dup
+  metadata['hewett_pos'] = 'true'
+  metadata['hewett_pos_emulator_test'] = 'true'
+  metadata['source'] = 'android_emulator'
 
   begin
     receipt_email = params[:receipt_email].to_s.strip
     customer = customer_for_receipt(
       receipt_email,
-      params[:customer_name]
+      metadata['customer_name']
     )
 
     payment_intent_params = {
@@ -515,6 +869,7 @@ post '/create_emulator_test_payment' do
     200
   )
 end
+
 
 # This endpoint captures a PaymentIntent.
 # https://stripe.com/docs/terminal/payments#capture
@@ -707,18 +1062,71 @@ get '/pos_transactions' do
   json_response(transactions, 200)
 end
 
-# Issues the maximum refund permitted by the Hewett POS return policy:
+# Calculates a return/refund without changing anything in Stripe.
+# The Android app uses this to show the exact customer refund and the
+# proportional restocking fee before the operator confirms the return.
+post '/preview_refund' do
+  validationError = validateApiKey
+  if !validationError.nil?
+    return json_response({ :error => validationError }, 400)
+  end
+
+  require_pos_authorization!
+
+  payment_intent_id = params['payment_intent_id'].to_s
+
+  if payment_intent_id.empty?
+    return json_response(
+      { :error => 'payment_intent_id is required.' },
+      400
+    )
+  end
+
+  begin
+    payment_intent =
+      Stripe::PaymentIntent.retrieve(payment_intent_id)
+
+    requested_item_ids =
+      params['item_ids']
+        .to_s
+        .split(',')
+        .map(&:strip)
+        .reject(&:empty?)
+
+    include_shipping =
+      params['include_shipping'].to_s == 'true'
+
+    quote = build_refund_quote(
+      payment_intent,
+      params['mode'].to_s,
+      requested_item_ids,
+      include_shipping,
+      params['custom_gross_cents'].to_i
+    )
+
+    quote.delete(:charge)
+
+    return json_response(quote, 200)
+  rescue ArgumentError => e
+    return json_response({ :error => e.message }, 400)
+  rescue RuntimeError => e
+    return json_response({ :error => e.message }, 409)
+  rescue Stripe::StripeError => e
+    return json_response(
+      { :error => "Error calculating refund: #{e.message}" },
+      402
+    )
+  end
+end
+
+# Issues either an item-level partial return, a custom partial refund, or a
+# full return. The actual original Stripe processing fee is allocated
+# proportionally to the cumulative gross value being returned. This means:
 #
-#   customer refund =
-#     original Stripe charge - actual original Stripe processing fee
-#     - any amount already refunded
-#
-# Because the original Stripe charge already includes artwork, applicable tax,
-# and shipping, those amounts are included in this return calculation. The only
-# retained amount is the actual original Stripe processing fee.
-#
-# The refund goes back to the original payment method. No card presentation on
-# the S710 is required.
+# - a 35% item return retains about 35% of the original Stripe fee;
+# - later partial returns continue from that same cumulative calculation; and
+# - if the entire original charge is eventually returned, the total retained
+#   restocking fees equal the original Stripe processing fee, never more.
 post '/refund_payment_intent' do
   validationError = validateApiKey
   if !validationError.nil?
@@ -740,83 +1148,57 @@ post '/refund_payment_intent' do
     payment_intent =
       Stripe::PaymentIntent.retrieve(payment_intent_id)
 
-    if payment_intent.status.to_s != 'succeeded'
-      return json_response(
-        {
-          :error =>
-            'Only successful captured payments can be refunded.'
-        },
-        400
-      )
-    end
+    requested_item_ids =
+      params['item_ids']
+        .to_s
+        .split(',')
+        .map(&:strip)
+        .reject(&:empty?)
 
-    if !pos_payment_intent?(payment_intent)
-      return json_response(
-        {
-          :error =>
-            'This payment was not created by the Hewett POS app.'
-        },
-        400
-      )
-    end
+    include_shipping =
+      params['include_shipping'].to_s == 'true'
 
-    charge = full_charge_for_payment_intent(payment_intent)
+    quote = build_refund_quote(
+      payment_intent,
+      params['mode'].to_s,
+      requested_item_ids,
+      include_shipping,
+      params['custom_gross_cents'].to_i
+    )
 
-    if charge.nil?
-      return json_response(
-        {
-          :error =>
-            'No successful charge was found for this payment.'
-        },
-        400
-      )
-    end
+    charge = quote[:charge]
 
-    original_amount = charge.amount.to_i
-    already_refunded = charge.amount_refunded.to_i
-    processing_fee = processing_fee_cents(charge)
-
-    if processing_fee.nil?
-      return json_response(
-        {
-          :error =>
-            'Stripe has not made the processing fee available yet. Try again shortly.'
-        },
-        409
-      )
-    end
-
-    maximum_policy_refund =
-      [original_amount - processing_fee, 0].max
-
-    refund_amount =
-      [maximum_policy_refund - already_refunded, 0].max
-
-    if refund_amount <= 0
-      return json_response(
-        {
-          :error =>
-            'No additional refund is available under the restocking-fee policy.'
-        },
-        400
-      )
-    end
-
-    # The idempotency key prevents a retry or accidental double tap from
-    # creating a duplicate refund for the same refund state.
     idempotency_key =
-      "hewett-pos-return-#{payment_intent.id}-#{already_refunded}-#{refund_amount}"
+      [
+        'hewett-pos-return',
+        payment_intent.id,
+        charge.amount_refunded.to_i,
+        quote[:mode],
+        quote[:grossReturnValueCents],
+        quote[:returnedItemIds].join('-'),
+        quote[:shippingRefundCents]
+      ].join('-')
 
     refund = Stripe::Refund.create(
       {
         :payment_intent => payment_intent.id,
-        :amount => refund_amount,
+        :amount => quote[:refundAmountCents],
         :reason => 'requested_by_customer',
         :metadata => {
-          :restocking_fee_cents => processing_fee.to_s,
-          :original_charge_cents => original_amount.to_s,
+          :hewett_pos_return => 'true',
+          :return_mode => quote[:mode],
+          :gross_return_value_cents =>
+            quote[:grossReturnValueCents].to_s,
+          :restocking_fee_retained_cents =>
+            quote[:restockingFeeThisRefundCents].to_s,
+          :processing_fee_original_cents =>
+            quote[:processingFeeCents].to_s,
+          :returned_item_ids =>
+            quote[:returnedItemIds].join(','),
+          :shipping_refunded_cents =>
+            quote[:shippingRefundCents].to_s,
           :refund_policy =>
-            'original_stripe_processing_fee_retained'
+            'proportional_original_stripe_processing_fee'
         }
       },
       {
@@ -828,14 +1210,28 @@ post '/refund_payment_intent' do
       {
         :refundId => refund.id,
         :paymentIntentId => payment_intent.id,
+        :preview => false,
+        :mode => quote[:mode],
+        :grossReturnValueCents =>
+          quote[:grossReturnValueCents],
         :refundAmountCents => refund.amount.to_i,
-        :processingFeeCents => processing_fee,
+        :processingFeeCents => quote[:processingFeeCents],
+        :restockingFeeThisRefundCents =>
+          quote[:restockingFeeThisRefundCents],
+        :restockingFeeRetainedCents =>
+          quote[:restockingFeeRetainedCents],
         :amountRefundedCents =>
-          already_refunded + refund.amount.to_i,
+          charge.amount_refunded.to_i + refund.amount.to_i,
+        :shippingRefundCents => quote[:shippingRefundCents],
+        :returnedItemIds => quote[:returnedItemIds],
         :status => refund.status.to_s
       },
       200
     )
+  rescue ArgumentError => e
+    return json_response({ :error => e.message }, 400)
+  rescue RuntimeError => e
+    return json_response({ :error => e.message }, 409)
   rescue Stripe::StripeError => e
     return json_response(
       { :error => "Error issuing refund: #{e.message}" },
