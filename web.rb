@@ -45,6 +45,17 @@ def json_response(payload, status_code = 200)
   payload.to_json
 end
 
+# Validate receipt emails before they are sent to Stripe. The Android app
+# performs the same check for user experience, but the backend remains the
+# final guard so malformed receipt_email values can never reach Stripe.
+def valid_receipt_email?(email)
+  normalized = email.to_s.strip
+  return false if normalized.empty?
+  return false if normalized.length > 254
+
+  !!(normalized =~ /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/)
+end
+
 def request_ip_address
   request.ip.to_s
 end
@@ -437,7 +448,7 @@ def pos_refund_state(payment_intent, charge)
 
     tracked_refund_amount += refund.amount.to_i
 
-    metadata =
+    raw_metadata =
       if refund.metadata.nil?
         {}
       elsif refund.metadata.respond_to?(:to_hash)
@@ -445,6 +456,15 @@ def pos_refund_state(payment_intent, charge)
       else
         refund.metadata
       end
+
+    # Normalize refund metadata keys exactly as we do PaymentIntent metadata.
+    # stripe-ruby can return symbol keys from StripeObject#to_hash. Without
+    # normalization, returned_item_ids is missed and an already-returned
+    # painting can incorrectly appear available for another return.
+    metadata = {}
+    raw_metadata.each do |key, value|
+      metadata[key.to_s] = value.to_s
+    end
 
     retained_fee =
       if metadata['restocking_fee_retained_cents'].to_s.empty?
@@ -623,6 +643,27 @@ def build_refund_quote(
     end
 
     requested = requested_item_ids.map(&:to_s).uniq
+
+    if requested.empty?
+      raise ArgumentError,
+        'Select at least one painting to return.'
+    end
+
+    already_returned =
+      requested.select { |item_id| returned_item_ids.include?(item_id) }
+
+    if !already_returned.empty?
+      raise ArgumentError,
+        'One or more selected paintings have already been returned.'
+    end
+
+    known_item_ids = items.map { |item| item[:id].to_s }
+    unknown_items = requested.reject { |item_id| known_item_ids.include?(item_id) }
+
+    if !unknown_items.empty?
+      raise ArgumentError,
+        'One or more selected paintings are not part of this transaction.'
+    end
 
     selected_items =
       available_items.select { |item| requested.include?(item[:id]) }
@@ -808,6 +849,12 @@ post '/create_payment_intent' do
 
   begin
     receipt_email = params[:receipt_email].to_s.strip
+
+    if !receipt_email.empty? && !valid_receipt_email?(receipt_email)
+      status 400
+      return log_info("Invalid receipt email address.")
+    end
+
     metadata = extract_pos_metadata(params)
     log_info("POS payment metadata item_count=#{metadata['item_count']} keys=#{metadata.keys.sort.join(',')}")
     customer_name = metadata['customer_name'].to_s
@@ -889,6 +936,14 @@ post '/create_emulator_test_payment' do
 
   begin
     receipt_email = params[:receipt_email].to_s.strip
+
+    if !receipt_email.empty? && !valid_receipt_email?(receipt_email)
+      return json_response(
+        { :error => 'Enter a valid receipt email address.' },
+        400
+      )
+    end
+
     customer = customer_for_receipt(
       receipt_email,
       metadata['customer_name']
@@ -1068,6 +1123,17 @@ post '/update_payment_intent' do
   begin
     allowed_keys = ["receipt_email"]
     update_params = params.select { |k, _| allowed_keys.include?(k) }
+
+    if update_params.key?("receipt_email")
+      receipt_email = update_params["receipt_email"].to_s.strip
+
+      if !receipt_email.empty? && !valid_receipt_email?(receipt_email)
+        status 400
+        return log_info("Invalid receipt email address.")
+      end
+
+      update_params["receipt_email"] = receipt_email
+    end
 
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent_id,
