@@ -437,7 +437,7 @@ def pos_refund_state(payment_intent, charge)
 
     tracked_refund_amount += refund.amount.to_i
 
-    raw_metadata =
+    metadata =
       if refund.metadata.nil?
         {}
       elsif refund.metadata.respond_to?(:to_hash)
@@ -445,15 +445,6 @@ def pos_refund_state(payment_intent, charge)
       else
         refund.metadata
       end
-
-    # Normalize refund metadata keys exactly as we do PaymentIntent metadata.
-    # stripe-ruby can return symbol keys from StripeObject#to_hash. Without
-    # normalization, returned_item_ids is missed and an already-returned
-    # painting can incorrectly appear available for another return.
-    metadata = {}
-    raw_metadata.each do |key, value|
-      metadata[key.to_s] = value.to_s
-    end
 
     retained_fee =
       if metadata['restocking_fee_retained_cents'].to_s.empty?
