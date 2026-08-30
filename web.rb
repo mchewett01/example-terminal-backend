@@ -4,6 +4,10 @@ require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 require 'rack/utils'
+require 'base64'
+require 'digest'
+require 'tempfile'
+require 'time'
 
 # Browsers require that external servers enable CORS when the server is at a different origin than the website.
 # https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
@@ -893,6 +897,112 @@ post '/create_payment_intent' do
   log_info("PaymentIntent successfully created: #{payment_intent.id}")
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
+end
+
+
+# Uploads the customer's handwritten signature to Stripe Files before the
+# PaymentIntent is created. Only a real PNG image is accepted. The returned
+# Stripe File ID, SHA-256 digest, and server-side signing timestamp are then
+# written to the PaymentIntent metadata by the Android app.
+#
+# Stripe's dedicated customer_signature file purpose is used so the signature
+# remains inside the same Stripe account as the payment rather than on the
+# Render filesystem.
+post '/upload_signature' do
+  validationError = validateApiKey
+  if !validationError.nil?
+    return json_response({ :error => validationError }, 400)
+  end
+
+  encoded = params[:signature_base64].to_s.strip
+
+  if encoded.empty?
+    return json_response(
+      { :error => 'A customer signature is required.' },
+      400
+    )
+  end
+
+  if encoded.start_with?('data:image/png;base64,')
+    encoded = encoded.sub('data:image/png;base64,', '')
+  end
+
+  begin
+    bytes = Base64.strict_decode64(encoded)
+  rescue ArgumentError
+    return json_response(
+      { :error => 'The customer signature image is invalid.' },
+      400
+    )
+  end
+
+  if bytes.empty?
+    return json_response(
+      { :error => 'The customer signature image is empty.' },
+      400
+    )
+  end
+
+  # Stripe permits customer_signature files up to 4 MB. Reject oversized
+  # payloads here before writing anything to disk or calling Stripe.
+  if bytes.bytesize > 4 * 1024 * 1024
+    return json_response(
+      { :error => 'The customer signature image is too large.' },
+      400
+    )
+  end
+
+  png_magic = "\x89PNG\r\n\x1A\n".b
+
+  if bytes.byteslice(0, 8) != png_magic
+    return json_response(
+      { :error => 'Only PNG customer signatures are accepted.' },
+      400
+    )
+  end
+
+  sha256 = Digest::SHA256.hexdigest(bytes)
+  signed_at = Time.now.utc.iso8601
+
+  begin
+    uploaded_file = nil
+
+    Tempfile.create(['hewett-pos-signature-', '.png']) do |tempfile|
+      tempfile.binmode
+      tempfile.write(bytes)
+      tempfile.flush
+
+      uploaded_file = Stripe::File.create(
+        {
+          :purpose => 'customer_signature',
+          :file => File.new(tempfile.path)
+        }
+      )
+    end
+
+    log_info(
+      "Customer signature uploaded: #{uploaded_file.id} sha256=#{sha256}"
+    )
+
+    return json_response(
+      {
+        :signatureFileId => uploaded_file.id,
+        :sha256 => sha256,
+        :signedAt => signed_at
+      },
+      200
+    )
+  rescue Stripe::StripeError => e
+    return json_response(
+      { :error => "Unable to save customer signature: #{e.message}" },
+      402
+    )
+  rescue StandardError => e
+    return json_response(
+      { :error => "Unable to save customer signature: #{e.message}" },
+      500
+    )
+  end
 end
 
 
