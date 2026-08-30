@@ -868,13 +868,23 @@ post '/create_payment_intent' do
       customer_name
     )
 
+    # Hewett POS uses a standard card-present PaymentIntent with manual capture.
+    #
+    # Do NOT forward Rack/Sinatra's raw params[:payment_method_options] object
+    # here. Android form fields such as:
+    #   payment_method_options[card_present[request_extended_authorization]]
+    # can be materialized by Rack in a shape that is not valid for Stripe's
+    # nested payment_method_options API and causes PaymentIntent creation to
+    # fail before the S710 can present its native card-collection screen.
+    #
+    # Extended and incremental authorizations are not used by Hewett POS, so
+    # the safest and correct request is to omit payment_method_options entirely.
     payment_intent_params = {
-      :payment_method_types => params[:payment_method_types] || ['card_present'],
-      :capture_method => params[:capture_method] || 'manual',
+      :payment_method_types => ['card_present'],
+      :capture_method => 'manual',
       :amount => params[:amount],
       :currency => params[:currency] || 'usd',
-      :description => params[:description] || 'Example PaymentIntent',
-      :payment_method_options => params[:payment_method_options] || [],
+      :description => params[:description] || 'Hewett POS sale',
       :metadata => metadata
     }
 
