@@ -258,10 +258,30 @@ end
 
 def payment_metadata(payment_intent)
   return {} if payment_intent.nil?
+
   metadata = payment_intent.metadata
   return {} if metadata.nil?
 
-  metadata.respond_to?(:to_hash) ? metadata.to_hash : metadata
+  raw_metadata =
+    if metadata.respond_to?(:to_hash)
+      metadata.to_hash
+    else
+      metadata
+    end
+
+  # Stripe::StripeObject#to_hash can yield symbol keys depending on the
+  # stripe-ruby object/version. The POS metadata written by this app is
+  # referenced everywhere else with string keys ("item_count",
+  # "item_0", etc.), so normalize every key here. Without this, a
+  # transaction can clearly contain item metadata in Stripe while the
+  # item-return parser sees an empty cart.
+  normalized = {}
+
+  raw_metadata.each do |key, value|
+    normalized[key.to_s] = value.to_s
+  end
+
+  normalized
 end
 
 # Extracts POS metadata from an Android form request in a way that is robust
